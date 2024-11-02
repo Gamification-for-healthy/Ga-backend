@@ -16,43 +16,64 @@ import (
 )
 
 func MongoConnect(mconn model.DBinfo) (*mongo.Database, error) {
-    // Coba koneksi awal dengan DBString yang diberikan
+    // Attempt initial connection with the provided DBString
     client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(mconn.DBString))
     if err != nil {
-        // Jika gagal, lakukan SRVLookup dan coba kembali
-        mconn.DBString = SRVLookup(mconn.DBString)
+        fmt.Println("Initial connection failed, attempting SRV lookup...")
+        
+        // Perform SRV lookup to construct a new MongoDB URI
+        mconn.DBString, err = SRVLookup(mconn.DBString)
+        if err != nil {
+            return nil, fmt.Errorf("failed to perform SRV lookup: %w", err)
+        }
+
+        // Retry connecting to MongoDB with the updated URI from SRV lookup
         client, err = mongo.Connect(context.TODO(), options.Client().ApplyURI(mconn.DBString))
         if err != nil {
-            return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
+            return nil, fmt.Errorf("failed to connect to MongoDB after SRV lookup: %w", err)
         }
     }
 
-    // Verifikasi koneksi ke MongoDB
+    // Verify the connection to MongoDB by pinging the database
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     if err := client.Ping(ctx, nil); err != nil {
         return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
     }
 
-    // Pilih database dan kembalikan
+    // Select the specified database and return the instance
     db := client.Database(mconn.DBName)
     return db, nil
 }
 
-func SRVLookup(srvuri string) (mongouri string) {
+func SRVLookup(srvuri string) (mongouri string, err error) {
     atsplits := strings.Split(srvuri, "@")
-    userpass := strings.Split(atsplits[0], "//")[1]
+    if len(atsplits) < 2 {
+        return "", fmt.Errorf("invalid SRV URI format: missing '@' part")
+    }
+
+    // Extract user and password from the first part
+    userpassPart := atsplits[0]
+    if !strings.Contains(userpassPart, "//") {
+        return "", fmt.Errorf("invalid SRV URI format: missing '//' in the userpass part")
+    }
+    userpass := strings.Split(userpassPart, "//")[1]
     mongouri = "mongodb://" + userpass + "@"
 
+    // Extract domain and database name from the second part
     slashsplits := strings.Split(atsplits[1], "/")
+    if len(slashsplits) < 2 {
+        return "", fmt.Errorf("invalid SRV URI format: missing '/' in the domain/dbname part")
+    }
     domain := slashsplits[0]
     dbname := slashsplits[1]
 
+    // Set up a custom DNS resolver to look up SRV records
     r := &net.Resolver{
         PreferGo: true,
         Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
             d := net.Dialer{
-                Timeout: time.Millisecond * time.Duration(10000),
+                Timeout: 10 * time.Second,
             }
             return d.DialContext(ctx, network, "8.8.8.8:53")
         },
@@ -61,25 +82,29 @@ func SRVLookup(srvuri string) (mongouri string) {
     // Lookup SRV records for MongoDB
     _, srvs, err := r.LookupSRV(context.Background(), "mongodb", "tcp", domain)
     if err != nil {
-        panic(err)
+        return "", fmt.Errorf("SRV lookup failed: %w", err)
     }
 
     var srvlist string
     for _, srv := range srvs {
-        srvlist += strings.TrimSuffix(srv.Target, ".") + ":" + strconv.FormatUint(uint64(srv.Port), 10) + ","
+        srvlist += strings.TrimSuffix(srv.Target, ".") + ":" + strconv.Itoa(int(srv.Port)) + ","
     }
 
-    // Lookup TXT records for MongoDB
-    txtrecords, _ := r.LookupTXT(context.Background(), domain)
+    // Lookup TXT records for MongoDB, if any
+    txtrecords, err := r.LookupTXT(context.Background(), domain)
+    if err != nil {
+        // Not a critical error, just log it and proceed
+        txtrecords = []string{}
+    }
+
     var txtlist string
     for _, txt := range txtrecords {
         txtlist += txt
     }
 
     mongouri = mongouri + strings.TrimSuffix(srvlist, ",") + "/" + dbname + "?ssl=true&" + txtlist
-    return
-} 
-
+    return mongouri, nil
+}
 func GetAllDistinctDoc(db *mongo.Database, filter bson.M, fieldname, collection string) (doc []any, err error) {
 	ctx := context.TODO()
 	doc, err = db.Collection(collection).Distinct(ctx, fieldname, filter)
